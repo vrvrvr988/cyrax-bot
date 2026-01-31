@@ -397,6 +397,4 @@ bot.on("message", async (msg) => {
   }
 
   // GENERATE username flow
-  if (isAdmin(userId) && pendingUsername.has(String(chatId))) {
-    const pending = pendingUsername.get(String(chatId));
-
+  if (isAdmin(userId)
