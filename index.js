@@ -9,7 +9,9 @@
  * ENV (Render -> Environment):
  *  - BOT_TOKEN (required)
  *  - ADMIN_ID  (required) e.g. 899914946
- *  - PANEL_GENERATE_URL (required)
+ *  - PANEL_GENERATE_URL_1D (required) for 1-day key generation
+ *  - PANEL_GENERATE_URL_3D (required) for 3-day key generation
+ *  - PANEL_GENERATE_URL_7D (required) for 7-day key generation
  *  - CHAT_ID (required) e.g. -1003552668286
  *
  * Optional:
@@ -23,9 +25,6 @@
 const http = require("http");
 const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
-const dotenv = require("dotenv");
-
-dotenv.config();
 
 // Dummy HTTP server for Render
 const PORT = process.env.PORT || 3000;
@@ -39,7 +38,9 @@ http
 // ENV (environment variables)
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_ID = String(process.env.ADMIN_ID || "");
-const PANEL_GENERATE_URL = process.env.PANEL_GENERATE_URL || "";
+const PANEL_GENERATE_URL_1D = process.env.PANEL_GENERATE_URL_1D || "https://panel.cyrax.info/generateKey/1d";
+const PANEL_GENERATE_URL_3D = process.env.PANEL_GENERATE_URL_3D || "https://panel.cyrax.info/generateKey/3d";
+const PANEL_GENERATE_URL_7D = process.env.PANEL_GENERATE_URL_7D || "https://panel.cyrax.info/generateKey/7d";
 const CHAT_ID = process.env.CHAT_ID ? String(process.env.CHAT_ID) : "";
 
 const PANEL_API_KEY = process.env.PANEL_API_KEY || "";
@@ -50,7 +51,9 @@ const BOT_BRAND = process.env.BOT_BRAND || "CYRAX CORE";
 
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN not set");
 if (!ADMIN_ID) throw new Error("ADMIN_ID not set");
-if (!PANEL_GENERATE_URL) throw new Error("PANEL_GENERATE_URL not set");
+if (!PANEL_GENERATE_URL_1D) throw new Error("PANEL_GENERATE_URL_1D not set");
+if (!PANEL_GENERATE_URL_3D) throw new Error("PANEL_GENERATE_URL_3D not set");
+if (!PANEL_GENERATE_URL_7D) throw new Error("PANEL_GENERATE_URL_7D not set");
 if (!CHAT_ID) throw new Error("CHAT_ID not set");
 
 // Helpers
@@ -117,11 +120,11 @@ function findKeyInObject(obj) {
   return null;
 }
 
-async function callPanelGenerateKey() {
+async function callPanelGenerateKey(url) {
   const headers = {};
   if (PANEL_API_KEY) headers[PANEL_API_KEY_HEADER] = PANEL_API_KEY;
 
-  const res = await axios.get(PANEL_GENERATE_URL, {
+  const res = await axios.get(url, {
     timeout: PANEL_TIMEOUT_MS,
     maxRedirects: 5,
     headers,
@@ -217,7 +220,7 @@ bot.on("polling_error", (err) => {
 });
 
 // Actions
-async function generateForUsername(adminChatId, adminUserId, username, dedupeKey) {
+async function generateForUsername(adminChatId, adminUserId, username, dedupeKey, duration) {
   if (processed.has(dedupeKey)) {
     return bot.sendMessage(adminChatId, "🛡 Уже обработано (защита от дубля).");
   }
@@ -232,9 +235,18 @@ async function generateForUsername(adminChatId, adminUserId, username, dedupeKey
   setCooldown(adminUserId);
 
   try {
-    await bot.sendMessage(adminChatId, `⚡ Генерирую ключ для <b>${escapeHtml(username)}</b>…`, { parse_mode: "HTML" });
+    await bot.sendMessage(adminChatId, `⚡ Генерирую ключ для <b>${escapeHtml(username)}</b>...`, { parse_mode: "HTML" });
 
-    const r = await callPanelGenerateKey();
+    let generateUrl;
+    if (duration === "1d") {
+      generateUrl = PANEL_GENERATE_URL_1D;
+    } else if (duration === "3d") {
+      generateUrl = PANEL_GENERATE_URL_3D;
+    } else if (duration === "7d") {
+      generateUrl = PANEL_GENERATE_URL_7D;
+    }
+
+    const r = await callPanelGenerateKey(generateUrl);
     if (!r.ok) {
       return bot.sendMessage(adminChatId, `❌ <b>Ошибка панели</b>\n${escapeHtml(r.error)}`, {
         parse_mode: "HTML",
@@ -249,7 +261,7 @@ async function generateForUsername(adminChatId, adminUserId, username, dedupeKey
       `🔑 <b>Ключ для ${escapeHtml(username)}</b>\n` +
       `<code>${escapeHtml(key)}</code>\n` +
       `━━━━━━━━━━━━━━\n` +
-      `Админ: <code>${adminUserId}</code>`;
+      `Админ: <code>@${escapeHtml(adminUserId)}</code>`;
 
     await bot.sendMessage(CHAT_ID, chatMsg, { parse_mode: "HTML" });
 
@@ -280,6 +292,7 @@ bot.onText(/\/whoami/, async (msg) => {
   await bot.sendMessage(msg.chat.id, `chat_id: ${msg.chat.id}\nadmin: ${isAdmin(msg.from?.id)}`);
 });
 
+// /gen -> Asks username and duration
 bot.onText(/\/gen/, async (msg) => {
   cleanup();
   if (!isAdmin(msg.from?.id)) return bot.sendMessage(msg.chat.id, "⛔ Доступ ограничен. Напиши админу.");
@@ -321,7 +334,9 @@ bot.on("callback_query", async (q) => {
       `🧪 <b>SELF TEST</b>\n` +
         `BOT_TOKEN: ✅\n` +
         `ADMIN_ID: ✅\n` +
-        `PANEL_GENERATE_URL: ${PANEL_GENERATE_URL ? "✅" : "❌"}\n` +
+        `PANEL_GENERATE_URL_1D: ${PANEL_GENERATE_URL_1D ? "✅" : "❌"}\n` +
+        `PANEL_GENERATE_URL_3D: ${PANEL_GENERATE_URL_3D ? "✅" : "❌"}\n` +
+        `PANEL_GENERATE_URL_7D: ${PANEL_GENERATE_URL_7D ? "✅" : "❌"}\n` +
         `CHAT_ID: ${CHAT_ID ? "✅" : "❌"}\n` +
         `COOLDOWN_SECONDS: <b>${COOLDOWN_SECONDS}</b>\n` +
         `genInProgress: <b>${genInProgress ? "YES" : "NO"}</b>`,
@@ -330,6 +345,7 @@ bot.on("callback_query", async (q) => {
   }
 
   if (q.data === "post") {
+    // simple post flow: next message will be posted to CHAT_ID
     pendingUsername.delete(String(chatId));
     processed.set(`await_post:${chatId}`, now());
     processed.set(`await_post_ttl:${chatId}`, now() + 5 * 60 * 1000);
@@ -347,7 +363,6 @@ bot.on("callback_query", async (q) => {
   }
 });
 
-// Message handler for flows
 bot.on("message", async (msg) => {
   cleanup();
 
@@ -370,7 +385,7 @@ bot.on("message", async (msg) => {
 
     if (!isAdmin(userId)) return; // only admin can use it
     processed.delete(`await_post:${chatId}`);
-    processed.delete(`await_post_ttl:${chatId}`); 
+    processed.delete(`await_post_ttl:${chatId}`);
 
     try {
       await bot.sendMessage(CHAT_ID, `📣 <b>${BOT_BRAND}</b>\n\n${escapeHtml(text)}`, { parse_mode: "HTML" });
@@ -393,13 +408,4 @@ bot.on("message", async (msg) => {
       pendingUsername.set(String(chatId), { reqId, createdAt: now() });
       return bot.sendMessage(
         chatId,
-        "⚠️ Юзернейм не похож на Telegram.\nНапиши так: <code>@durov</code>",
-        { parse_mode: "HTML", ...menuKeyboard(true) }
-      );
-    }
-
-    const username = normalizeUsername(text);
-    const dedupeKey = `${username}:${chatId}:${now()}`;
-    await generateForUsername(chatId, userId, username, dedupeKey);
-  }
-});
+        "
