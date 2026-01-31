@@ -23,6 +23,11 @@
 const http = require("http");
 const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
+const moment = require("moment");
+const uuid = require("uuid");
+const dotenv = require("dotenv");
+
+dotenv.config();
 
 // Dummy HTTP server for Render
 const PORT = process.env.PORT || 3000;
@@ -387,16 +392,4 @@ bot.on("message", async (msg) => {
 
     if (!isValidUsernameInput(text)) {
       const reqId = `req:${chatId}:${msg.message_id}:${now()}`;
-      pendingUsername.set(String(chatId), { reqId, createdAt: now() });
-      return bot.sendMessage(
-        chatId,
-        "⚠️ Юзернейм не похож на Telegram.\nНапиши так: <code>@durov</code>",
-        { parse_mode: "HTML", ...menuKeyboard(true) }
-      );
-    }
-
-    const username = normalizeUsername(text);
-    const dedupeKey = `${username}:${chatId}:${now()}`;
-    await generateForUsername(chatId, userId, username, dedupeKey);
-  }
-});
+     
