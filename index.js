@@ -1,24 +1,30 @@
 /**
- * CYRAX CORE BOT — Render (Polling + Dummy HTTP)
+ * CYRAX CORE BOT — Render (Polling) + Generate-to-Chat flow
+ *
+ * Flow:
+ *  Admin clicks "⚡ Генерировать" -> bot asks @username -> generates exactly 1 key -> posts to CHAT_ID:
+ *    "🔑 Ключ для @durov: KEY"
+ *  Admin receives confirmation in DM, key is NOT shown in DM (only in chat).
  *
  * ENV (Render -> Environment):
- *  - BOT_TOKEN (обязательно)
- *  - ADMIN_ID  (обязательно) например 899914946
+ *  - BOT_TOKEN (required)
+ *  - ADMIN_ID  (required) e.g. 899914946
+ *  - PANEL_GENERATE_URL (required)
+ *  - CHAT_ID (required) e.g. -1003552668286
  *
- *  - PANEL_GENERATE_URL (полная ссылка генерации)
- *  - PANEL_API_KEY (если нужен)
- *  - PANEL_API_KEY_HEADER (по умолчанию Authorization)
- *  - PANEL_TIMEOUT_MS (по умолчанию 15000)
- *  - COOLDOWN_SECONDS (по умолчанию 15)
- *  - CHAT_ID (для постинга в чат, например -1003552668286)
- *  - BOT_BRAND (по умолчанию CYRAX CORE)
+ * Optional:
+ *  - PANEL_API_KEY
+ *  - PANEL_API_KEY_HEADER (default Authorization)
+ *  - PANEL_TIMEOUT_MS (default 15000)
+ *  - COOLDOWN_SECONDS (default 15)
+ *  - BOT_BRAND (default CYRAX CORE)
  */
 
 const http = require("http");
 const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
 
-// ---------- Render wants a port: dummy HTTP ----------
+// ---------- Dummy HTTP server for Render ----------
 const PORT = process.env.PORT || 3000;
 http
   .createServer((req, res) => {
@@ -31,55 +37,44 @@ http
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_ID = String(process.env.ADMIN_ID || "");
 const PANEL_GENERATE_URL = process.env.PANEL_GENERATE_URL || "";
+const CHAT_ID = process.env.CHAT_ID ? String(process.env.CHAT_ID) : "";
+
 const PANEL_API_KEY = process.env.PANEL_API_KEY || "";
 const PANEL_API_KEY_HEADER = process.env.PANEL_API_KEY_HEADER || "Authorization";
 const PANEL_TIMEOUT_MS = Number(process.env.PANEL_TIMEOUT_MS || "15000");
 const COOLDOWN_SECONDS = Number(process.env.COOLDOWN_SECONDS || "15");
-const CHAT_ID = process.env.CHAT_ID ? String(process.env.CHAT_ID) : "";
 const BOT_BRAND = process.env.BOT_BRAND || "CYRAX CORE";
 
 if (!BOT_TOKEN) throw new Error("BOT_TOKEN not set");
 if (!ADMIN_ID) throw new Error("ADMIN_ID not set");
-
-// ---------- State (in-memory) ----------
-const processedActionKeys = new Map(); // anti-duplicate for callbacks/messages
-const userCooldown = new Map(); // userId -> lastTs
-const keyHistory = [];
-const HISTORY_LIMIT = 50;
-
-let genInProgress = false;
+if (!PANEL_GENERATE_URL) throw new Error("PANEL_GENERATE_URL not set");
+if (!CHAT_ID) throw new Error("CHAT_ID not set");
 
 // ---------- Helpers ----------
 const now = () => Date.now();
 const isAdmin = (id) => String(id) === ADMIN_ID;
 
-function cleanupMaps() {
-  const t = now();
-  const TTL = 10 * 60 * 1000;
-  for (const [k, v] of processedActionKeys) if (t - v > TTL) processedActionKeys.delete(k);
-
-  const CDTTL = 60 * 60 * 1000;
-  for (const [k, v] of userCooldown) if (t - v > CDTTL) userCooldown.delete(k);
+function escapeHtml(s) {
+  return String(s || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
-function cooldownLeft(userId) {
-  const last = userCooldown.get(String(userId)) || 0;
-  const diff = Math.floor((now() - last) / 1000);
-  const left = COOLDOWN_SECONDS - diff;
-  return left > 0 ? left : 0;
+function isValidUsernameInput(s) {
+  const t = String(s || "").trim();
+  if (!t) return false;
+  // allow: @name or name (we will add @)
+  const clean = t.startsWith("@") ? t.slice(1) : t;
+  // telegram usernames: 5-32 chars, letters digits underscore; in practice sometimes shorter - keep it len>=3 to be permissive
+  if (clean.length < 3 || clean.length > 32) return false;
+  return /^[A-Za-z0-9_]+$/.test(clean);
 }
 
-function setCooldown(userId) {
-  userCooldown.set(String(userId), now());
-}
-
-function pushHistory(item) {
-  keyHistory.unshift(item);
-  if (keyHistory.length > HISTORY_LIMIT) keyHistory.length = HISTORY_LIMIT;
-}
-
-function prettyTime(ts) {
-  return new Date(ts).toLocaleString("ru-RU");
+function normalizeUsername(s) {
+  const t = String(s || "").trim();
+  const clean = t.startsWith("@") ? t.slice(1) : t;
+  return "@" + clean;
 }
 
 function looksLikeKey(s) {
@@ -91,7 +86,6 @@ function looksLikeKey(s) {
 
 function findKeyInObject(obj) {
   if (!obj || typeof obj !== "object") return null;
-
   const direct = [
     obj.key,
     obj.license,
@@ -103,18 +97,15 @@ function findKeyInObject(obj) {
     obj.result && obj.result.license,
     obj.result && obj.result.token,
   ];
-
   for (const c of direct) {
     if (typeof c === "string" && looksLikeKey(c)) return c.trim();
   }
-
   if (Array.isArray(obj)) {
     for (const it of obj) {
       const f = findKeyInObject(it);
       if (f) return f;
     }
   }
-
   for (const v of Object.values(obj)) {
     if (typeof v === "string" && looksLikeKey(v)) return v.trim();
     if (typeof v === "object" && v) {
@@ -122,15 +113,10 @@ function findKeyInObject(obj) {
       if (f) return f;
     }
   }
-
   return null;
 }
 
 async function callPanelGenerateKey() {
-  if (!PANEL_GENERATE_URL) {
-    return { ok: false, error: "PANEL_GENERATE_URL не задан (Render → Environment)." };
-  }
-
   const headers = {};
   if (PANEL_API_KEY) headers[PANEL_API_KEY_HEADER] = PANEL_API_KEY;
 
@@ -152,7 +138,7 @@ async function callPanelGenerateKey() {
   if (typeof res.data === "object" && res.data) {
     const key = findKeyInObject(res.data);
     if (key) return { ok: true, key };
-    return { ok: false, error: "Панель вернула JSON, но ключ не найден.", raw: JSON.stringify(res.data).slice(0, 400) };
+    return { ok: false, error: "Панель вернула JSON, но ключ не найден." };
   }
 
   const text = String(res.data || "").trim();
@@ -161,243 +147,258 @@ async function callPanelGenerateKey() {
   const match = text.match(/[A-Za-z0-9\-_:.=+/]{8,200}/);
   if (match && looksLikeKey(match[0])) return { ok: true, key: match[0] };
 
-  return { ok: false, error: "Не распознал ключ в ответе панели.", raw: text.slice(0, 400) };
+  return { ok: false, error: "Не распознал ключ в ответе панели." };
 }
 
+// ---------- Anti-dup / state ----------
+const processed = new Map();       // generic dedupe keys with timestamps
+const userCooldown = new Map();    // userId -> lastTs
+let genInProgress = false;
+
+// pending username request per admin chat
+// pendingUsername[chatId] = { reqId, createdAt }
+const pendingUsername = new Map();
+
+function cleanup() {
+  const t = now();
+  const TTL = 10 * 60 * 1000;
+
+  for (const [k, v] of processed) if (t - v > TTL) processed.delete(k);
+
+  const CDTTL = 60 * 60 * 1000;
+  for (const [k, v] of userCooldown) if (t - v > CDTTL) userCooldown.delete(k);
+
+  // pending username ttl 5 min
+  for (const [k, v] of pendingUsername) {
+    if (t - v.createdAt > 5 * 60 * 1000) pendingUsername.delete(k);
+  }
+}
+
+function cooldownLeft(userId) {
+  const last = userCooldown.get(String(userId)) || 0;
+  const diff = Math.floor((now() - last) / 1000);
+  const left = COOLDOWN_SECONDS - diff;
+  return left > 0 ? left : 0;
+}
+function setCooldown(userId) {
+  userCooldown.set(String(userId), now());
+}
+
+// ---------- UI ----------
 function menuKeyboard(admin) {
   const rows = [];
   if (admin) {
-    rows.push([{ text: "⚡ Генерировать ключ", callback_data: "gen" }]);
-    rows.push([{ text: "📜 История", callback_data: "history" }, { text: "🧹 Очистить", callback_data: "clear" }]);
-    rows.push([{ text: "📣 Постинг", callback_data: "post" }, { text: "🧪 SELF TEST", callback_data: "selftest" }]);
+    rows.push([{ text: "⚡ Генерировать", callback_data: "gen" }, { text: "🧪 SELF TEST", callback_data: "selftest" }]);
+    rows.push([{ text: "📣 Постинг", callback_data: "post" }, { text: "🏠 Меню", callback_data: "menu" }]);
   } else {
-    rows.push([{ text: "ℹ️ Инфо", callback_data: "info" }]);
+    rows.push([{ text: "🏠 Меню", callback_data: "menu" }]);
   }
-  rows.push([{ text: "🏠 Меню", callback_data: "menu" }]);
-
   return { reply_markup: { inline_keyboard: rows } };
 }
 
-function mainText(admin) {
+function mainText(admin, chatId) {
   return (
     `🕶 <b>${BOT_BRAND}</b>\n` +
     `━━━━━━━━━━━━━━\n` +
     (admin ? `Роль: <b>ADMIN</b>\n` : `Доступ: <b>ограничен</b>\n`) +
-    `Команды:\n` +
-    `/start\n/ping\n/whoami\n` +
-    (admin ? `/gen  (админ)\n/history (админ)\n/clear (админ)\n/post (админ)\n` : ``) +
-    `━━━━━━━━━━━━━━\n` +
+    `Ваш chat_id: <code>${chatId}</code>\n` +
+    `Команды: /start /ping /whoami` +
+    (admin ? ` /gen` : ``) +
+    `\n━━━━━━━━━━━━━━\n` +
     `Жми кнопки ниже 👇`
   );
 }
 
-// ---------- BOT START (Polling) ----------
-// ВАЖНО: если Telegram выдаёт 409 — это означает второй polling где-то ещё.
-// Мы не "лечим" 409 кодом, но мы делаем поведение мягким: не спамим панель, не падаем навсегда.
+// ---------- BOT ----------
 const bot = new TelegramBot(BOT_TOKEN, {
-  polling: {
-    autoStart: true,
-    params: { timeout: 30 },
-  },
+  polling: { autoStart: true, params: { timeout: 30 } },
 });
 
 bot.on("polling_error", (err) => {
-  // Чтобы не падал сервис, логируем и живём
-  const msg = String(err?.message || err);
-  console.error("polling_error:", msg);
-
-  // Частая: 409 conflict
-  // НЕ делаем тут restart бесконечно: Telegram всё равно не даст, пока второй экземпляр жив.
+  console.error("polling_error:", String(err?.message || err));
 });
 
-// ---------- Commands ----------
-bot.onText(/\/start/, async (msg) => {
-  cleanupMaps();
-  const admin = isAdmin(msg.from?.id);
-  await bot.sendMessage(msg.chat.id, mainText(admin), { parse_mode: "HTML", ...menuKeyboard(admin) });
-});
-
-bot.onText(/\/ping/, async (msg) => {
-  cleanupMaps();
-  await bot.sendMessage(msg.chat.id, "🏓 pong");
-});
-
-bot.onText(/\/whoami/, async (msg) => {
-  cleanupMaps();
-  await bot.sendMessage(msg.chat.id, `chat_id: ${msg.chat.id}\nadmin: ${isAdmin(msg.from?.id)}`);
-});
-
-bot.onText(/\/history/, async (msg) => {
-  cleanupMaps();
-  if (!isAdmin(msg.from?.id)) return bot.sendMessage(msg.chat.id, "⛔ Доступ ограничен. Напиши админу.");
-  if (keyHistory.length === 0) return bot.sendMessage(msg.chat.id, "📜 История пуста.");
-
-  const lines = keyHistory
-    .slice(0, 15)
-    .map((h, i) => `${i + 1}) <code>${h.key}</code>\n   🕒 ${prettyTime(h.ts)}`)
-    .join("\n\n");
-
-  await bot.sendMessage(msg.chat.id, `📜 <b>История</b>\n\n${lines}`, { parse_mode: "HTML", ...menuKeyboard(true) });
-});
-
-bot.onText(/\/clear/, async (msg) => {
-  cleanupMaps();
-  if (!isAdmin(msg.from?.id)) return bot.sendMessage(msg.chat.id, "⛔ Доступ ограничен.");
-  keyHistory.length = 0;
-  await bot.sendMessage(msg.chat.id, "🧹 История очищена.");
-});
-
-bot.onText(/\/post/, async (msg) => {
-  cleanupMaps();
-  if (!isAdmin(msg.from?.id)) return bot.sendMessage(msg.chat.id, "⛔ Доступ ограничен.");
-  if (!CHAT_ID) return bot.sendMessage(msg.chat.id, "⚠️ CHAT_ID не задан в Render → Environment.");
-  processedActionKeys.set(`await_post:${ADMIN_ID}`, now());
-  await bot.sendMessage(msg.chat.id, "📣 Отправь следующее сообщение — я запощу его в чат (1 сообщение).");
-});
-
-async function doGenerate(chatId, userId, dedupeKey) {
-  // антидубль по ключу действия
-  if (processedActionKeys.has(dedupeKey)) {
-    return bot.sendMessage(chatId, "🛡 Уже обработано (защита от дубля).");
+// ---------- Actions ----------
+async function generateForUsername(adminChatId, adminUserId, username, dedupeKey) {
+  // strict: 1 request = 1 generate. We dedupe hard.
+  if (processed.has(dedupeKey)) {
+    return bot.sendMessage(adminChatId, "🛡 Уже обработано (защита от дубля).");
   }
-  processedActionKeys.set(dedupeKey, now());
+  processed.set(dedupeKey, now());
 
-  const left = cooldownLeft(userId);
-  if (left > 0) return bot.sendMessage(chatId, `⏳ Подожди ${left} сек.`);
+  const left = cooldownLeft(adminUserId);
+  if (left > 0) return bot.sendMessage(adminChatId, `⏳ Подожди ${left} сек.`);
 
-  if (genInProgress) return bot.sendMessage(chatId, "⏳ Генерация уже идёт. Подожди пару секунд.");
+  if (genInProgress) return bot.sendMessage(adminChatId, "⏳ Генерация уже идёт. Подожди пару секунд.");
 
   genInProgress = true;
-  setCooldown(userId);
+  setCooldown(adminUserId);
 
   try {
-    await bot.sendMessage(chatId, "⚡ Генерирую ключ…");
+    await bot.sendMessage(adminChatId, `⚡ Генерирую ключ для <b>${escapeHtml(username)}</b>…`, { parse_mode: "HTML" });
 
     const r = await callPanelGenerateKey();
     if (!r.ok) {
-      const extra = r.raw ? `\n\n<pre>${String(r.raw).replace(/</g, "&lt;")}</pre>` : "";
-      return bot.sendMessage(chatId, `❌ <b>Ошибка панели</b>\n${r.error}${extra}`, {
+      return bot.sendMessage(adminChatId, `❌ <b>Ошибка панели</b>\n${escapeHtml(r.error)}`, {
         parse_mode: "HTML",
         ...menuKeyboard(true),
       });
     }
 
     const key = String(r.key || "").trim();
-    pushHistory({ key, ts: now() });
 
-    return bot.sendMessage(
-      chatId,
-      `✅ <b>Ключ:</b>\n<code>${key}</code>\n\n🛡 1 нажатие = 1 ключ`,
-      { parse_mode: "HTML", ...menuKeyboard(true) }
-    );
+    // send ONLY to the chat (your money safety)
+    const chatMsg =
+      `🔑 <b>Ключ для ${escapeHtml(username)}</b>\n` +
+      `<code>${escapeHtml(key)}</code>\n` +
+      `━━━━━━━━━━━━━━\n` +
+      `Админ: <code>${adminUserId}</code>`;
+
+    await bot.sendMessage(CHAT_ID, chatMsg, { parse_mode: "HTML" });
+
+    // confirm to admin
+    return bot.sendMessage(adminChatId, "✅ Готово. Отправил ключ в чат.", { ...menuKeyboard(true) });
   } catch (e) {
-    console.error(e);
-    return bot.sendMessage(chatId, "❗ Ошибка. Проверь логи Render.");
+    console.error("generate error:", e?.message || e);
+    return bot.sendMessage(adminChatId, "❗ Ошибка. Проверь логи Render.", { ...menuKeyboard(true) });
   } finally {
     genInProgress = false;
   }
 }
 
+// ---------- Commands ----------
+bot.onText(/\/start/, async (msg) => {
+  cleanup();
+  const admin = isAdmin(msg.from?.id);
+  await bot.sendMessage(msg.chat.id, mainText(admin, msg.chat.id), { parse_mode: "HTML", ...menuKeyboard(admin) });
+});
+
+bot.onText(/\/ping/, async (msg) => {
+  cleanup();
+  await bot.sendMessage(msg.chat.id, "🏓 pong");
+});
+
+bot.onText(/\/whoami/, async (msg) => {
+  cleanup();
+  await bot.sendMessage(msg.chat.id, `chat_id: ${msg.chat.id}\nadmin: ${isAdmin(msg.from?.id)}`);
+});
+
+// /gen -> asks username
 bot.onText(/\/gen/, async (msg) => {
-  cleanupMaps();
-  const chatId = msg.chat.id;
-  const userId = msg.from?.id;
+  cleanup();
+  if (!isAdmin(msg.from?.id)) return bot.sendMessage(msg.chat.id, "⛔ Доступ ограничен. Напиши админу.");
 
-  if (!isAdmin(userId)) return bot.sendMessage(chatId, "⛔ Доступ ограничен. Напиши админу.");
+  const reqId = `req:${msg.chat.id}:${msg.message_id}:${now()}`;
+  pendingUsername.set(String(msg.chat.id), { reqId, createdAt: now() });
 
-  // дедуп по message_id
-  const key = `gen:msg:${chatId}:${msg.message_id}`;
-  await doGenerate(chatId, userId, key);
+  await bot.sendMessage(
+    msg.chat.id,
+    "👤 Для кого ключ?\nНапиши юзернейм одним сообщением:\n<code>@durov</code>",
+    { parse_mode: "HTML", ...menuKeyboard(true) }
+  );
 });
 
 // ---------- Buttons ----------
 bot.on("callback_query", async (q) => {
-  cleanupMaps();
+  cleanup();
   try { await bot.answerCallbackQuery(q.id); } catch {}
 
-  const data = q.data || "";
   const chatId = q.message?.chat?.id;
   const userId = q.from?.id;
   if (!chatId) return;
 
-  // дедуп по callback id
-  const cbKey = `cb:${q.id}`;
-  if (processedActionKeys.has(cbKey)) return;
-  processedActionKeys.set(cbKey, now());
-
   const admin = isAdmin(userId);
 
-  if (data === "menu") {
-    return bot.sendMessage(chatId, mainText(admin), { parse_mode: "HTML", ...menuKeyboard(admin) });
-  }
+  // dedupe callback itself
+  const cbKey = `cb:${q.id}`;
+  if (processed.has(cbKey)) return;
+  processed.set(cbKey, now());
 
-  if (data === "info") {
-    return bot.sendMessage(chatId, `ℹ️ <b>${BOT_BRAND}</b>\nДоступ ограничен.\nНапиши админу.`, {
-      parse_mode: "HTML",
-      ...menuKeyboard(false),
-    });
+  if (q.data === "menu") {
+    return bot.sendMessage(chatId, mainText(admin, chatId), { parse_mode: "HTML", ...menuKeyboard(admin) });
   }
 
   if (!admin) return bot.sendMessage(chatId, "⛔ Доступ ограничен. Напиши админу.");
 
-  if (data === "history") {
-    if (keyHistory.length === 0) return bot.sendMessage(chatId, "📜 История пуста.");
-    const lines = keyHistory
-      .slice(0, 15)
-      .map((h, i) => `${i + 1}) <code>${h.key}</code>\n   🕒 ${prettyTime(h.ts)}`)
-      .join("\n\n");
-    return bot.sendMessage(chatId, `📜 <b>История</b>\n\n${lines}`, { parse_mode: "HTML", ...menuKeyboard(true) });
-  }
-
-  if (data === "clear") {
-    keyHistory.length = 0;
-    return bot.sendMessage(chatId, "🧹 История очищена.");
-  }
-
-  if (data === "selftest") {
+  if (q.data === "selftest") {
     return bot.sendMessage(
       chatId,
-      `🧪 <b>SELF TEST</b>\nBOT_TOKEN: ✅\nADMIN_ID: ✅\nPANEL_GENERATE_URL: ${PANEL_GENERATE_URL ? "✅" : "❌"}\nCHAT_ID: ${
-        CHAT_ID ? "✅" : "❌"
-      }\nCOOLDOWN_SECONDS: <b>${COOLDOWN_SECONDS}</b>`,
+      `🧪 <b>SELF TEST</b>\n` +
+        `BOT_TOKEN: ✅\n` +
+        `ADMIN_ID: ✅\n` +
+        `PANEL_GENERATE_URL: ${PANEL_GENERATE_URL ? "✅" : "❌"}\n` +
+        `CHAT_ID: ${CHAT_ID ? "✅" : "❌"}\n` +
+        `COOLDOWN_SECONDS: <b>${COOLDOWN_SECONDS}</b>\n` +
+        `genInProgress: <b>${genInProgress ? "YES" : "NO"}</b>`,
       { parse_mode: "HTML", ...menuKeyboard(true) }
     );
   }
 
-  if (data === "post") {
-    if (!CHAT_ID) return bot.sendMessage(chatId, "⚠️ CHAT_ID не задан в Render → Environment.");
-    processedActionKeys.set(`await_post:${ADMIN_ID}`, now());
-    return bot.sendMessage(chatId, "📣 Отправь следующее сообщение — я запощу его в чат (1 сообщение).");
+  if (q.data === "post") {
+    // simple post flow: next message will be posted to CHAT_ID
+    pendingUsername.delete(String(chatId));
+    processed.set(`await_post:${chatId}`, now());
+    processed.set(`await_post_ttl:${chatId}`, now() + 5 * 60 * 1000);
+    return bot.sendMessage(chatId, "📣 Отправь следующее сообщение — я запощу его в чат (1 сообщение).", { ...menuKeyboard(true) });
   }
 
-  if (data === "gen") {
-    // дедуп по callback + message_id (двойной тап)
-    const dedupe = `gen:cb:${chatId}:${q.message?.message_id || "m"}:${q.id}`;
-    return doGenerate(chatId, userId, dedupe);
+  if (q.data === "gen") {
+    const reqId = `req:${chatId}:${q.message?.message_id || "m"}:${q.id}:${now()}`;
+    pendingUsername.set(String(chatId), { reqId, createdAt: now() });
+    return bot.sendMessage(
+      chatId,
+      "👤 Для кого ключ?\nНапиши юзернейм одним сообщением:\n<code>@durov</code>",
+      { parse_mode: "HTML", ...menuKeyboard(true) }
+    );
   }
 });
 
-// ---------- Await post handler ----------
+// ---------- Message handler for flows ----------
 bot.on("message", async (msg) => {
-  cleanupMaps();
+  cleanup();
+
+  const chatId = msg.chat?.id;
   const userId = msg.from?.id;
   const text = (msg.text || "").trim();
-  if (!text) return;
+  if (!chatId || !userId || !text) return;
+
+  // ignore commands
   if (text.startsWith("/")) return;
 
-  const awaitKey = `await_post:${ADMIN_ID}`;
-  if (isAdmin(userId) && processedActionKeys.has(awaitKey)) {
-    processedActionKeys.delete(awaitKey);
-    if (!CHAT_ID) return bot.sendMessage(msg.chat.id, "⚠️ CHAT_ID не задан.");
+  // POST flow TTL
+  const ttl = processed.get(`await_post_ttl:${chatId}`) || 0;
+  if (processed.has(`await_post:${chatId}`)) {
+    if (ttl && now() > ttl) {
+      processed.delete(`await_post:${chatId}`);
+      processed.delete(`await_post_ttl:${chatId}`);
+      return bot.sendMessage(chatId, "⏳ Режим постинга истёк. Нажми 📣 Постинг ещё раз.", { ...menuKeyboard(isAdmin(userId)) });
+    }
+
+    if (!isAdmin(userId)) return; // only admin can use it
+    processed.delete(`await_post:${chatId}`);
+    processed.delete(`await_post_ttl:${chatId}`);
 
     try {
-      await bot.sendMessage(CHAT_ID, `📣 <b>${BOT_BRAND}</b>\n\n${text}`, { parse_mode: "HTML" });
-      await bot.sendMessage(msg.chat.id, "✅ Запостил в чат.");
+      await bot.sendMessage(CHAT_ID, `📣 <b>${BOT_BRAND}</b>\n\n${escapeHtml(text)}`, { parse_mode: "HTML" });
+      return bot.sendMessage(chatId, "✅ Запостил в чат.", { ...menuKeyboard(true) });
     } catch (e) {
-      console.error(e);
-      await bot.sendMessage(msg.chat.id, "❌ Не смог запостить. Проверь, что бот добавлен в чат и может писать.");
+      console.error("post error:", e?.message || e);
+      return bot.sendMessage(chatId, "❌ Не смог запостить. Проверь, что бот добавлен в чат и может писать.", { ...menuKeyboard(true) });
     }
   }
-});
 
-console.log("✅ CYRAX bot started (polling)...");
+  // GENERATE username flow
+  if (isAdmin(userId) && pendingUsername.has(String(chatId))) {
+    const pending = pendingUsername.get(String(chatId));
+
+    // clear pending BEFORE calling panel (so repeated telegram retries won't cause regen)
+    pendingUsername.delete(String(chatId));
+
+    if (!isValidUsernameInput(text)) {
+      // if invalid, re-open the flow
+      const reqId = `req:${chatId}:${msg.message_id}:${now()}`;
+      pendingUsername.set(String(chatId), { reqId, createdAt: now() });
+      return bot.sendMessage(
+        chatId,
+        "⚠️ Юзернейм не похож на Telegram.\nНапиши так: <code>@durov</code>",
+        { parse_mode: "HTML",
