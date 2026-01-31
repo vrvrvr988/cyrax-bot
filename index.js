@@ -1,407 +1,381 @@
 /**
- * CYRAX CORE BOT — Render (Polling) + Generate-to-Chat flow
- *
- * Flow:
- * Admin clicks "⚡ Генерировать" -> bot asks @username -> asks duration (1d/3d/7d) -> generates exactly 1 key -> posts to CHAT_ID:
- * "🔑 Ключ для @durov: KEY"
- * Admin receives confirmation in DM, key is NOT shown in DM (only in chat).
- *
- * ENV (Render -> Environment):
- * - BOT_TOKEN (required)
- * - ADMIN_ID (required) e.g. 899914946
- * - PANEL_GENERATE_URL_1D (required) for 1-day key generation
- * - PANEL_GENERATE_URL_3D (required) for 3-day key generation
- * - PANEL_GENERATE_URL_7D (required) for 7-day key generation
- * - CHAT_ID (required) e.g. -1003552668286
- *
- * Optional:
- * - PANEL_API_KEY
- * - PANEL_API_KEY_HEADER (default Authorization)
- * - PANEL_TIMEOUT_MS (default 15000)
- * - COOLDOWN_SECONDS (default 15)
- * - BOT_BRAND (default CYRAX CORE)
+ * CYRAX CORE BOT — Render Polling + Generate-to-Chat
+ * Версия с усиленной защитой от дублей сообщений
+ * Последнее обновление: февраль 2026
  */
+
 const http = require("http");
 const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
 
-// Dummy HTTP server for Render
+// Dummy server для Render (keep-alive)
 const PORT = process.env.PORT || 3000;
-http
-  .createServer((req, res) => {
-    res.writeHead(200, { "Content-Type": "text/plain" });
-    res.end("CYRAX bot is running\n");
-  })
-  .listen(PORT, () => console.log(`🌐 HTTP alive on ${PORT}`));
+http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("CYRAX bot alive\n");
+}).listen(PORT, () => console.log(`HTTP server on ${PORT}`));
 
-// ENV (environment variables)
+// ENV
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_ID = String(process.env.ADMIN_ID || "");
-const PANEL_GENERATE_URL_1D = process.env.PANEL_GENERATE_URL_1D || "https://panel.cyrax.info/generateKey/1d";
-const PANEL_GENERATE_URL_3D = process.env.PANEL_GENERATE_URL_3D || "https://panel.cyrax.info/generateKey/3d";
-const PANEL_GENERATE_URL_7D = process.env.PANEL_GENERATE_URL_7D || "https://panel.cyrax.info/generateKey/7d";
+const PANEL_GENERATE_URL_1D = process.env.PANEL_GENERATE_URL_1D;
+const PANEL_GENERATE_URL_3D = process.env.PANEL_GENERATE_URL_3D;
+const PANEL_GENERATE_URL_7D = process.env.PANEL_GENERATE_URL_7D;
 const CHAT_ID = process.env.CHAT_ID ? String(process.env.CHAT_ID) : "";
 const PANEL_API_KEY = process.env.PANEL_API_KEY || "";
 const PANEL_API_KEY_HEADER = process.env.PANEL_API_KEY_HEADER || "Authorization";
-const PANEL_TIMEOUT_MS = Number(process.env.PANEL_TIMEOUT_MS || "15000");
-const COOLDOWN_SECONDS = Number(process.env.COOLDOWN_SECONDS || "15");
+const PANEL_TIMEOUT_MS = Number(process.env.PANEL_TIMEOUT_MS || 15000);
+const COOLDOWN_SECONDS = Number(process.env.COOLDOWN_SECONDS || 15);
 const BOT_BRAND = process.env.BOT_BRAND || "CYRAX CORE";
 
-if (!BOT_TOKEN) throw new Error("BOT_TOKEN not set");
-if (!ADMIN_ID) throw new Error("ADMIN_ID not set");
-if (!PANEL_GENERATE_URL_1D) throw new Error("PANEL_GENERATE_URL_1D not set");
-if (!PANEL_GENERATE_URL_3D) throw new Error("PANEL_GENERATE_URL_3D not set");
-if (!PANEL_GENERATE_URL_7D) throw new Error("PANEL_GENERATE_URL_7D not set");
-if (!CHAT_ID) throw new Error("CHAT_ID not set");
+if (!BOT_TOKEN) throw new Error("BOT_TOKEN не задан");
+if (!ADMIN_ID) throw new Error("ADMIN_ID не задан");
+if (!PANEL_GENERATE_URL_1D || !PANEL_GENERATE_URL_3D || !PANEL_GENERATE_URL_7D) {
+  throw new Error("Не заданы URL генерации ключей");
+}
+if (!CHAT_ID) throw new Error("CHAT_ID не задан");
 
 // Helpers
 const now = () => Date.now();
 const isAdmin = (id) => String(id) === ADMIN_ID;
 
 function escapeHtml(s) {
-  return String(s || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+  return String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-function isValidUsernameInput(s) {
+function isValidUsername(s) {
   const t = String(s || "").trim();
   if (!t) return false;
   const clean = t.startsWith("@") ? t.slice(1) : t;
-  if (clean.length < 3 || clean.length > 32) return false;
-  return /^[A-Za-z0-9_]+$/.test(clean);
+  return clean.length >= 3 && clean.length <= 32 && /^[A-Za-z0-9_]+$/.test(clean);
 }
 
 function normalizeUsername(s) {
-  const t = String(s || "").trim();
-  const clean = t.startsWith("@") ? t.slice(1) : t;
+  const clean = String(s || "").trim().replace(/^@/, "");
   return "@" + clean;
 }
 
 function looksLikeKey(s) {
-  if (!s) return false;
-  const t = String(s).trim();
-  if (t.length < 6 || t.length > 200) return false;
-  return /^[A-Za-z0-9\-_:.=+/]+$/.test(t);
+  const t = String(s || "").trim();
+  return t.length >= 6 && t.length <= 200 && /^[A-Za-z0-9\-_:.=+/]+$/.test(t);
 }
 
-function findKeyInObject(obj) {
-  if (!obj || typeof obj !== "object") return null;
-  const direct = [
-    obj.key,
-    obj.license,
-    obj.token,
-    obj.code,
-    obj.data && obj.data.key,
-    obj.data && obj.data.license,
-    obj.result && obj.result.key,
-    obj.result && obj.result.license,
-    obj.result && obj.result.token,
+function findKeyInResponse(data) {
+  if (!data || typeof data !== "object") return null;
+
+  const candidates = [
+    data.key, data.license, data.token, data.code,
+    data.data?.key, data.data?.license, data.data?.token,
+    data.result?.key, data.result?.license, data.result?.token
   ];
-  for (const c of direct) {
-    if (typeof c === "string" && looksLikeKey(c)) return c.trim();
-  }
-  if (Array.isArray(obj)) {
-    for (const it of obj) {
-      const f = findKeyInObject(it);
-      if (f) return f;
-    }
-  }
-  for (const v of Object.values(obj)) {
+
+  for (const v of candidates) {
     if (typeof v === "string" && looksLikeKey(v)) return v.trim();
-    if (typeof v === "object" && v) {
-      const f = findKeyInObject(v);
-      if (f) return f;
+  }
+
+  // глубокий поиск
+  for (const v of Object.values(data)) {
+    if (typeof v === "string" && looksLikeKey(v)) return v.trim();
+    if (v && typeof v === "object") {
+      const found = findKeyInResponse(v);
+      if (found) return found;
     }
   }
   return null;
 }
 
-async function callPanelGenerateKey(url) {
-  console.log(`Запрос к панели: ${url}`);
-  const headers = {};
-  if (PANEL_API_KEY) headers[PANEL_API_KEY_HEADER] = PANEL_API_KEY;
+async function generateKeyFromPanel(url) {
+  console.log(`[PANEL] Запрос → ${url}`);
+  const headers = PANEL_API_KEY ? { [PANEL_API_KEY_HEADER]: PANEL_API_KEY } : {};
+
   try {
     const res = await axios.get(url, {
       timeout: PANEL_TIMEOUT_MS,
-      maxRedirects: 5,
       headers,
-      validateStatus: () => true,
+      validateStatus: () => true
     });
-    console.log(`Панель ответила: HTTP ${res.status}, data type: ${typeof res.data}, preview: ${String(res.data).slice(0, 200)}`);
+
+    console.log(`[PANEL] Ответ: ${res.status} | ${String(res.data).slice(0, 180)}...`);
+
     if (res.status < 200 || res.status >= 300) {
-      const body =
-        typeof res.data === "string"
-          ? res.data.slice(0, 250)
-          : JSON.stringify(res.data).slice(0, 250);
-      return { ok: false, error: `Панель вернула HTTP ${res.status}: ${body}` };
+      return { ok: false, error: `HTTP ${res.status}: ${String(res.data).slice(0, 120)}` };
     }
-    if (typeof res.data === "object" && res.data) {
-      const key = findKeyInObject(res.data);
-      if (key) return { ok: true, key };
-      return { ok: false, error: "Панель вернула JSON, но ключ не найден." };
+
+    let key = null;
+    if (typeof res.data === "object") {
+      key = findKeyInResponse(res.data);
+    } else {
+      const text = String(res.data).trim();
+      key = looksLikeKey(text) ? text : text.match(/[A-Za-z0-9\-_:.=+/]{8,200}/)?.[0];
     }
-    const text = String(res.data || "").trim();
-    if (looksLikeKey(text)) return { ok: true, key: text };
-    const match = text.match(/[A-Za-z0-9\-_:.=+/]{8,200}/);
-    if (match && looksLikeKey(match[0])) return { ok: true, key: match[0] };
-    return { ok: false, error: "Не распознал ключ в ответе панели." };
-  } catch (e) {
-    console.error("Ошибка в callPanelGenerateKey:", e.message, e.code, e.response?.status);
-    return { ok: false, error: `Ошибка запроса: ${e.message}` };
+
+    if (key) return { ok: true, key };
+    return { ok: false, error: "Ключ не найден в ответе" };
+  } catch (err) {
+    console.error("[PANEL ERROR]", err.message, err.code);
+    return { ok: false, error: err.message || "Ошибка соединения с панелью" };
   }
 }
 
-// Anti-duplication / state management
-const processed = new Map();
-const userCooldown = new Map();
+// State & protection
+const processed = new Map();          // dedupe
+const actionLocks = new Map();        // анти-флуд на 3–5 сек
 let genInProgress = false;
-const pendingState = new Map(); // Теперь храним состояние: { stage: 'username' | 'duration', username: string }
+const pending = new Map();            // {stage: 'wait_username'|'wait_duration', username?, createdAt}
 
 function cleanup() {
   const t = now();
-  const TTL = 10 * 60 * 1000;
-  for (const [k, v] of processed) if (t - v > TTL) processed.delete(k);
-  const CDTTL = 60 * 60 * 1000;
-  for (const [k, v] of userCooldown) if (t - v > CDTTL) userCooldown.delete(k);
-  for (const [k, v] of pendingState) {
-    if (t - v.createdAt > 5 * 60 * 1000) pendingState.delete(k);
-  }
+  for (const [k, v] of processed)    if (t - v > 15*60*1000) processed.delete(k);
+  for (const [k, v] of actionLocks)  if (t > v) actionLocks.delete(k);
+  for (const [k, v] of pending)      if (t - v.createdAt > 10*60*1000) pending.delete(k);
 }
 
-function cooldownLeft(userId) {
-  const last = userCooldown.get(String(userId)) || 0;
-  const diff = Math.floor((now() - last) / 1000);
-  const left = COOLDOWN_SECONDS - diff;
-  return left > 0 ? left : 0;
+function isLocked(userId, action = "gen") {
+  const key = `lock:${userId}:${action}`;
+  return actionLocks.has(key);
 }
 
-function setCooldown(userId) {
-  userCooldown.set(String(userId), now());
+function lock(userId, action = "gen", seconds = 4) {
+  const key = `lock:${userId}:${action}`;
+  actionLocks.set(key, now() + seconds * 1000);
 }
 
-// UI Keyboard
-function menuKeyboard(admin) {
-  const rows = [];
-  if (admin) {
-    rows.push([{ text: "⚡ Генерировать", callback_data: "gen" }, { text: "🧪 SELF TEST", callback_data: "selftest" }]);
-    rows.push([{ text: "📣 Постинг", callback_data: "post" }, { text: "🏠 Меню", callback_data: "menu" }]);
-  } else {
-    rows.push([{ text: "🏠 Меню", callback_data: "menu" }]);
-  }
-  return { reply_markup: { inline_keyboard: rows } };
+// UI
+function mainKeyboard(isAdmin) {
+  if (!isAdmin) return { reply_markup: { inline_keyboard: [[{ text: "🏠 Меню", callback_data: "menu" }]] } };
+
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "⚡ Генерировать", callback_data: "gen" },
+          { text: "🧪 SELF TEST", callback_data: "selftest" }
+        ],
+        [
+          { text: "📣 Постинг", callback_data: "post" },
+          { text: "🏠 Меню", callback_data: "menu" }
+        ]
+      ]
+    }
+  };
 }
 
 function durationKeyboard() {
   return {
     reply_markup: {
       inline_keyboard: [
-        [{ text: "1 день", callback_data: "dur:1d" }, { text: "3 дня", callback_data: "dur:3d" }, { text: "7 дней", callback_data: "dur:7d" }],
-        [{ text: "Отмена", callback_data: "cancel" }],
+        [
+          { text: "1 день", callback_data: "dur:1d" },
+          { text: "3 дня", callback_data: "dur:3d" },
+          { text: "7 дней", callback_data: "dur:7d" }
+        ],
+        [{ text: "Отмена", callback_data: "cancel" }]
       ]
     }
   };
 }
 
-function mainText(admin, chatId) {
-  return (
-    `🕶 <b>${BOT_BRAND}</b>\n` +
-    `━━━━━━━━━━━━━━\n` +
-    (admin ? `Роль: <b>ADMIN</b>\n` : `Доступ: <b>ограничен</b>\n`) +
-    `Ваш chat_id: <code>${chatId}</code>\n` +
-    `Команды: /start /ping /whoami` +
-    (admin ? ` /gen` : "") +
-    `\n━━━━━━━━━━━━━━\n` +
-    `Жми кнопки ниже 👇`
-  );
+function mainMessageText(chatId, isAdmin) {
+  return `🕶 <b>${BOT_BRAND}</b>\n━━━━━━━━━━━━━━\n` +
+    (isAdmin ? `Роль: <b>ADMIN</b>\n` : `Доступ: <b>ограничен</b>\n`) +
+    `chat_id: <code>${chatId}</code>\n` +
+    `Команды: /start /ping /whoami` + (isAdmin ? ` /gen` : "") +
+    `\n━━━━━━━━━━━━━━\nЖми кнопки ниже 👇`;
 }
 
-// Bot Setup
-const bot = new TelegramBot(BOT_TOKEN, {
-  polling: { autoStart: true, params: { timeout: 30 } },
-});
+// Bot
+const bot = new TelegramBot(BOT_TOKEN, { polling: { timeout: 30 } });
 
-bot.on("polling_error", (err) => {
-  console.error("polling_error:", String(err?.message || err));
-});
+bot.on("polling_error", err => console.error("Polling error:", err.message || err));
 
-// Actions
-async function generateForUsername(adminChatId, adminUserId, username, duration) {
-  const dedupeKey = `gen:${adminUserId}:${username}:${duration}:${now()}`;
-  if (processed.has(dedupeKey)) {
-    return bot.sendMessage(adminChatId, "🛡 Уже обработано (защита от дубля).");
-  }
-  processed.set(dedupeKey, now());
-  const left = cooldownLeft(adminUserId);
-  if (left > 0) return bot.sendMessage(adminChatId, `⏳ Подожди ${left} сек.`);
-  if (genInProgress) return bot.sendMessage(adminChatId, "⏳ Генерация уже идёт. Подожди пару секунд.");
+// Генерация ключа
+async function doGenerate(chatId, userId, username, duration) {
+  const dedupe = `gen:${userId}:${username}:${duration}:${Math.floor(now()/10000)}`;
+  if (processed.has(dedupe)) return bot.sendMessage(chatId, "🛡 Уже обработано");
+
+  processed.set(dedupe, now());
+  lock(userId, "gen_full", 10);
+
+  if (genInProgress) return bot.sendMessage(chatId, "⏳ Генерация уже идёт...");
   genInProgress = true;
-  setCooldown(adminUserId);
+
   try {
-    await bot.sendMessage(adminChatId, `⚡ Генерирую ключ для <b>${escapeHtml(username)}</b> на ${duration.replace('d', ' день(я)') }...`, { parse_mode: "HTML" });
-    let generateUrl;
-    if (duration === "1d") generateUrl = PANEL_GENERATE_URL_1D;
-    else if (duration === "3d") generateUrl = PANEL_GENERATE_URL_3D;
-    else if (duration === "7d") generateUrl = PANEL_GENERATE_URL_7D;
-    else throw new Error("Invalid duration");
-    const r = await callPanelGenerateKey(generateUrl);
-    if (!r.ok) {
-      return bot.sendMessage(adminChatId, `❌ <b>Ошибка панели</b>\n${escapeHtml(r.error)}`, {
-        parse_mode: "HTML",
-        ...menuKeyboard(true),
+    await bot.sendMessage(chatId, `Генерирую ключ для ${escapeHtml(username)} (${duration})...`, { parse_mode: "HTML" });
+
+    let url;
+    if (duration === "1d") url = PANEL_GENERATE_URL_1D;
+    else if (duration === "3d") url = PANEL_GENERATE_URL_3D;
+    else if (duration === "7d") url = PANEL_GENERATE_URL_7D;
+    else throw new Error("Неверная длительность");
+
+    const result = await generateKeyFromPanel(url);
+    if (!result.ok) {
+      return bot.sendMessage(chatId, `❌ Ошибка панели:\n${escapeHtml(result.error)}`, {
+        parse_mode: "HTML", ...mainKeyboard(true)
       });
     }
-    const key = String(r.key || "").trim();
-    // Send to the chat (money protection)
-    const chatMsg =
+
+    const key = result.key;
+
+    // В чат (главный канал)
+    await bot.sendMessage(CHAT_ID, 
       `🔑 <b>Ключ для ${escapeHtml(username)}</b>\n` +
       `<code>${escapeHtml(key)}</code>\n` +
-      `━━━━━━━━━━━━━━\n` +
-      `Админ: <code>${adminUserId}</code>`;
-    await bot.sendMessage(CHAT_ID, chatMsg, { parse_mode: "HTML" });
-    // Confirm to admin
-    return bot.sendMessage(adminChatId, "✅ Готово. Отправил ключ в чат.", { ...menuKeyboard(true) });
-  } catch (e) {
-    console.error("generate error:", e?.message || e);
-    return bot.sendMessage(adminChatId, "❗ Ошибка. Проверь логи Render.", { ...menuKeyboard(true) });
+      `━━━━━━━━━━━━━━\nАдмин: ${userId}`,
+      { parse_mode: "HTML" }
+    );
+
+    await bot.sendMessage(chatId, "✅ Ключ отправлен в чат.", { ...mainKeyboard(true) });
+  } catch (err) {
+    console.error("Generate fail:", err);
+    await bot.sendMessage(chatId, "❗ Ошибка генерации. Проверь логи.", { ...mainKeyboard(true) });
   } finally {
     genInProgress = false;
   }
 }
 
-// Commands Handling
-bot.onText(/\/start/, async (msg) => {
+// Команды
+bot.onText(/\/start/, async msg => {
   cleanup();
-  const admin = isAdmin(msg.from?.id);
-  await bot.sendMessage(msg.chat.id, mainText(admin, msg.chat.id), { parse_mode: "HTML", ...menuKeyboard(admin) });
+  const cid = msg.chat.id;
+  const uid = msg.from.id;
+  const admin = isAdmin(uid);
+  await bot.sendMessage(cid, mainMessageText(cid, admin), { parse_mode: "HTML", ...mainKeyboard(admin) });
 });
 
-bot.onText(/\/ping/, async (msg) => {
-  cleanup();
-  await bot.sendMessage(msg.chat.id, "🏓 pong");
+bot.onText(/\/ping/, msg => bot.sendMessage(msg.chat.id, "🏓 pong"));
+
+bot.onText(/\/whoami/, msg => {
+  bot.sendMessage(msg.chat.id, `chat_id: ${msg.chat.id}\nadmin: ${isAdmin(msg.from.id)}`);
 });
 
-bot.onText(/\/whoami/, async (msg) => {
+bot.onText(/\/gen/, async msg => {
   cleanup();
-  await bot.sendMessage(msg.chat.id, `chat_id: ${msg.chat.id}\nadmin: ${isAdmin(msg.from?.id)}`);
-});
+  if (!isAdmin(msg.from.id)) return bot.sendMessage(msg.chat.id, "⛔ Только админ");
+  if (isLocked(msg.from.id)) return;
+  lock(msg.from.id);
 
-// /gen -> Asks username
-bot.onText(/\/gen/, async (msg) => {
-  cleanup();
-  if (!isAdmin(msg.from?.id)) return bot.sendMessage(msg.chat.id, "⛔ Доступ ограничен. Напиши админу.");
-  pendingState.set(String(msg.chat.id), { stage: 'username', createdAt: now() });
-  await bot.sendMessage(
-    msg.chat.id,
-    "👤 Для кого ключ?\nНапиши юзернейм одним сообщением:\n<code>@durov</code>",
-    { parse_mode: "HTML", ...menuKeyboard(true) }
+  pending.set(msg.chat.id, { stage: "wait_username", createdAt: now() });
+  await bot.sendMessage(msg.chat.id, 
+    "👤 Для кого ключ?\nНапиши @username одним сообщением",
+    { parse_mode: "HTML", ...mainKeyboard(true) }
   );
 });
 
-bot.on("callback_query", async (q) => {
+// Callback
+bot.on("callback_query", async q => {
   cleanup();
-  try { await bot.answerCallbackQuery(q.id); } catch {}
-  const chatId = q.message?.chat?.id;
-  const userId = q.from?.id;
-  if (!chatId) return;
-  const admin = isAdmin(userId);
-  // dedupe callback by user + data + message_id to avoid strict q.id issues
-  const cbKey = `cb:${userId}:${q.data}:${q.message?.message_id || ''}`;
-  if (processed.has(cbKey)) return;
-  processed.set(cbKey, now());
+  await bot.answerCallbackQuery(q.id).catch(() => {});
+
+  const cid = q.message?.chat?.id;
+  const uid = q.from?.id;
+  if (!cid || !uid) return;
+
+  const admin = isAdmin(uid);
+  if (!admin) return bot.sendMessage(cid, "⛔ Только админ");
+
+  // Жёсткий dedupe + lock
+  const dedupeKey = `cbq:${uid}:${q.data}:${q.message?.message_id || 0}`;
+  if (processed.has(dedupeKey)) {
+    console.log(`Повторный callback проигнорирован: ${dedupeKey}`);
+    return;
+  }
+  processed.set(dedupeKey, now());
+
+  if (isLocked(uid)) {
+    console.log(`Операция заблокирована (анти-флуд): ${uid}`);
+    return;
+  }
 
   if (q.data === "menu") {
-    return bot.sendMessage(chatId, mainText(admin, chatId), { parse_mode: "HTML", ...menuKeyboard(admin) });
+    return bot.sendMessage(cid, mainMessageText(cid, admin), { parse_mode: "HTML", ...mainKeyboard(admin) });
   }
-  if (!admin) return bot.sendMessage(chatId, "⛔ Доступ ограничен. Напиши админу.");
+
   if (q.data === "selftest") {
-    return bot.sendMessage(
-      chatId,
-      `🧪 <b>SELF TEST</b>\n` +
-        `BOT_TOKEN: ✅\n` +
-        `ADMIN_ID: ✅\n` +
-        `PANEL_GENERATE_URL_1D: ${PANEL_GENERATE_URL_1D ? "✅" : "❌"}\n` +
-        `PANEL_GENERATE_URL_3D: ${PANEL_GENERATE_URL_3D ? "✅" : "❌"}\n` +
-        `PANEL_GENERATE_URL_7D: ${PANEL_GENERATE_URL_7D ? "✅" : "❌"}\n` +
-        `CHAT_ID: ${CHAT_ID ? "✅" : "❌"}\n` +
-        `COOLDOWN_SECONDS: <b>${COOLDOWN_SECONDS}</b>\n` +
-        `genInProgress: <b>${genInProgress ? "YES" : "NO"}</b>`,
-      { parse_mode: "HTML", ...menuKeyboard(true) }
+    return bot.sendMessage(cid, 
+      `SELF TEST\n` +
+      `Admin: ${admin}\n` +
+      `genInProgress: ${genInProgress}\n` +
+      `Cooldown: ${COOLDOWN_SECONDS}s\n` +
+      `Pending states: ${pending.size}`,
+      { parse_mode: "HTML", ...mainKeyboard(true) }
     );
   }
+
   if (q.data === "post") {
-    // simple post flow: next message will be posted to CHAT_ID
-    pendingState.delete(String(chatId));
-    processed.set(`await_post:${chatId}`, now());
-    processed.set(`await_post_ttl:${chatId}`, now() + 5 * 60 * 1000);
-    return bot.sendMessage(chatId, "📣 Отправь следующее сообщение — я запощу его в чат (1 сообщение).", { ...menuKeyboard(true) });
+    pending.delete(cid);
+    processed.set(`post_mode:${cid}`, now() + 5*60*1000);
+    return bot.sendMessage(cid, "📣 Отправь сообщение — запощу его в чат (одно)", { ...mainKeyboard(true) });
   }
+
   if (q.data === "gen") {
-    pendingState.set(String(chatId), { stage: 'username', createdAt: now() });
-    return bot.sendMessage(
-      chatId,
-      "👤 Для кого ключ?\nНапиши юзернейм одним сообщением:\n<code>@durov</code>",
-      { parse_mode: "HTML", ...menuKeyboard(true) }
+    if (isLocked(uid, "gen")) return;
+    lock(uid, "gen");
+
+    pending.set(cid, { stage: "wait_username", createdAt: now() });
+    await bot.sendMessage(cid, 
+      "👤 Для кого ключ?\nНапиши @username одним сообщением",
+      { parse_mode: "HTML", ...mainKeyboard(true) }
     );
+    return;
   }
+
   if (q.data === "cancel") {
-    pendingState.delete(String(chatId));
-    return bot.sendMessage(chatId, "❌ Отменено.", { ...menuKeyboard(true) });
+    pending.delete(cid);
+    return bot.sendMessage(cid, "❌ Отменено", { ...mainKeyboard(true) });
   }
+
   if (q.data.startsWith("dur:")) {
-    const duration = q.data.split(":")[1];
-    const state = pendingState.get(String(chatId));
-    if (state && state.stage === 'duration' && state.username) {
-      pendingState.delete(String(chatId));
-      return generateForUsername(chatId, userId, state.username, duration);
-    } else {
-      return bot.sendMessage(chatId, "❌ Сессия истекла. Нажми Генерировать заново.");
+    const duration = q.data.slice(4);
+    const state = pending.get(cid);
+    if (!state || state.stage !== "wait_duration") {
+      return bot.sendMessage(cid, "Сессия истекла. Начни заново.", { ...mainKeyboard(true) });
     }
+
+    pending.delete(cid);
+    await doGenerate(cid, uid, state.username, duration);
   }
 });
 
-bot.on("message", async (msg) => {
+// Обычные сообщения
+bot.on("message", async msg => {
   cleanup();
-  const chatId = msg.chat?.id;
-  const userId = msg.from?.id;
-  const text = (msg.text || "").trim();
-  if (!chatId || !userId || !text) return; // Ignore non-text messages
-  // ignore commands
-  if (text.startsWith("/")) return;
-  console.log(`→ incoming message: chat=${chatId}, user=${userId}, text='${text.slice(0,50)}'`);
+  if (!msg.text?.trim() || msg.text.startsWith("/")) return;
 
-  // POST flow
-  const ttl = processed.get(`await_post_ttl:${chatId}`) || 0;
-  if (processed.has(`await_post:${chatId}`)) {
-    if (ttl && now() > ttl) {
-      processed.delete(`await_post:${chatId}`);
-      processed.delete(`await_post_ttl:${chatId}`);
-      return bot.sendMessage(chatId, "⏳ Режим постинга истёк. Нажми 📣 Постинг ещё раз.", { ...menuKeyboard(isAdmin(userId)) });
-    }
-    if (!isAdmin(userId)) return; // only admin can use it
-    processed.delete(`await_post:${chatId}`);
-    processed.delete(`await_post_ttl:${chatId}`);
+  const cid = msg.chat.id;
+  const uid = msg.from.id;
+  const text = msg.text.trim();
+
+  // Режим постинга
+  const postTTL = processed.get(`post_mode:${cid}`);
+  if (postTTL && now() < postTTL) {
+    if (!isAdmin(uid)) return;
+    processed.delete(`post_mode:${cid}`);
+
     try {
       await bot.sendMessage(CHAT_ID, `📣 <b>${BOT_BRAND}</b>\n\n${escapeHtml(text)}`, { parse_mode: "HTML" });
-      return bot.sendMessage(chatId, "✅ Запостил в чат.", { ...menuKeyboard(true) });
+      await bot.sendMessage(cid, "✅ Запостил", { ...mainKeyboard(true) });
     } catch (e) {
-      console.error("post error:", e?.message || e);
-      return bot.sendMessage(chatId, "❌ Не смог запостить. Проверь, что бот добавлен в чат и может писать.", { ...menuKeyboard(true) });
+      console.error("Постинг ошибка:", e.message);
+      await bot.sendMessage(cid, "❌ Не удалось запостить", { ...mainKeyboard(true) });
     }
+    return;
   }
 
-  // GENERATE flow (only for admin)
-  if (!isAdmin(userId)) return;
-  const state = pendingState.get(String(chatId));
-  if (!state) return; // No pending state, ignore
+  // Генерация — ждём юзернейм
+  const state = pending.get(cid);
+  if (!state || !isAdmin(uid)) return;
 
-  if (state.stage === 'username') {
-    if (!isValidUsernameInput(text)) {
-      return bot.sendMessage(chatId, "❌ Некорректный юзернейм. Пример: @durov\nПопробуй ещё раз.", { parse_mode: "HTML" });
+  if (state.stage === "wait_username") {
+    if (!isValidUsername(text)) {
+      return bot.sendMessage(cid, "❌ Некорректный @username. Попробуй ещё раз.");
     }
+
     const username = normalizeUsername(text);
-    pendingState.set(String(chatId), { stage: 'duration', username, createdAt: now() });
-    return bot.sendMessage(chatId, `📅 Выбери длительность для ${escapeHtml(username)}:`, { parse_mode: "HTML", ...durationKeyboard() });
+    pending.set(cid, { stage: "wait_duration", username, createdAt: now() });
+
+    await bot.sendMessage(cid, `Выбери срок для ${escapeHtml(username)}:`, durationKeyboard());
   }
 });
+
+console.log("CYRAX BOT запущен");
