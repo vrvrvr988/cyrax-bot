@@ -1,8 +1,9 @@
 {
   "name": "cyrax-bot",
-  "version": "1.0.0",
-  "description": "Cyrax Telegram Bot (Railway)",
+  "version": "2.0.0",
+  "description": "CYRAX Telegram Bot (Render polling)",
   "main": "index.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
