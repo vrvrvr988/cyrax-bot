@@ -405,7 +405,4 @@ bot.on("message", async (msg) => {
 
     if (!isValidUsernameInput(text)) {
       const reqId = `req:${chatId}:${msg.message_id}:${now()}`;
-      pendingUsername.set(String(chatId), { reqId, createdAt: now() });
-      return bot.sendMessage(
-        chatId,
-        "
+      pendingUsername.set(String(chatId), { reqId
