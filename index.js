@@ -397,4 +397,24 @@ bot.on("message", async (msg) => {
   }
 
   // GENERATE username flow
-  if (isAdmin(userId)
+  if (isAdmin(userId) && pendingUsername.has(String(chatId))) {
+    const pending = pendingUsername.get(String(chatId));
+
+    // clear pending BEFORE calling panel (so repeated telegram retries won't cause regen)
+    pendingUsername.delete(String(chatId));
+
+    if (!isValidUsernameInput(text)) {
+      const reqId = `req:${chatId}:${msg.message_id}:${now()}`;
+      pendingUsername.set(String(chatId), { reqId, createdAt: now() });
+      return bot.sendMessage(
+        chatId,
+        "⚠️ Юзернейм не похож на Telegram.\nНапиши так: <code>@durov</code>",
+        { parse_mode: "HTML", ...menuKeyboard(true) }
+      );
+    }
+
+    const username = normalizeUsername(text);
+    const dedupeKey = `${username}:${chatId}:${now()}`;
+    await generateForUsername(chatId, userId, username, dedupeKey, "1d");
+  }
+});
