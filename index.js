@@ -2,26 +2,25 @@
  * CYRAX CORE BOT — Render (Polling) + Generate-to-Chat flow
  *
  * Flow:
- *  Admin clicks "⚡ Генерировать" -> bot asks @username -> generates exactly 1 key -> posts to CHAT_ID:
- *    "🔑 Ключ для @durov: KEY"
- *  Admin receives confirmation in DM, key is NOT shown in DM (only in chat).
+ * Admin clicks "⚡ Генерировать" -> bot asks @username -> asks duration (1d/3d/7d) -> generates exactly 1 key -> posts to CHAT_ID:
+ * "🔑 Ключ для @durov: KEY"
+ * Admin receives confirmation in DM, key is NOT shown in DM (only in chat).
  *
  * ENV (Render -> Environment):
- *  - BOT_TOKEN (required)
- *  - ADMIN_ID  (required) e.g. 899914946
- *  - PANEL_GENERATE_URL_1D (required) for 1-day key generation
- *  - PANEL_GENERATE_URL_3D (required) for 3-day key generation
- *  - PANEL_GENERATE_URL_7D (required) for 7-day key generation
- *  - CHAT_ID (required) e.g. -1003552668286
+ * - BOT_TOKEN (required)
+ * - ADMIN_ID (required) e.g. 899914946
+ * - PANEL_GENERATE_URL_1D (required) for 1-day key generation
+ * - PANEL_GENERATE_URL_3D (required) for 3-day key generation
+ * - PANEL_GENERATE_URL_7D (required) for 7-day key generation
+ * - CHAT_ID (required) e.g. -1003552668286
  *
  * Optional:
- *  - PANEL_API_KEY
- *  - PANEL_API_KEY_HEADER (default Authorization)
- *  - PANEL_TIMEOUT_MS (default 15000)
- *  - COOLDOWN_SECONDS (default 15)
- *  - BOT_BRAND (default CYRAX CORE)
+ * - PANEL_API_KEY
+ * - PANEL_API_KEY_HEADER (default Authorization)
+ * - PANEL_TIMEOUT_MS (default 15000)
+ * - COOLDOWN_SECONDS (default 15)
+ * - BOT_BRAND (default CYRAX CORE)
  */
-
 const http = require("http");
 const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
@@ -42,7 +41,6 @@ const PANEL_GENERATE_URL_1D = process.env.PANEL_GENERATE_URL_1D || "https://pane
 const PANEL_GENERATE_URL_3D = process.env.PANEL_GENERATE_URL_3D || "https://panel.cyrax.info/generateKey/3d";
 const PANEL_GENERATE_URL_7D = process.env.PANEL_GENERATE_URL_7D || "https://panel.cyrax.info/generateKey/7d";
 const CHAT_ID = process.env.CHAT_ID ? String(process.env.CHAT_ID) : "";
-
 const PANEL_API_KEY = process.env.PANEL_API_KEY || "";
 const PANEL_API_KEY_HEADER = process.env.PANEL_API_KEY_HEADER || "Authorization";
 const PANEL_TIMEOUT_MS = Number(process.env.PANEL_TIMEOUT_MS || "15000");
@@ -121,56 +119,54 @@ function findKeyInObject(obj) {
 }
 
 async function callPanelGenerateKey(url) {
+  console.log(`Запрос к панели: ${url}`);
   const headers = {};
   if (PANEL_API_KEY) headers[PANEL_API_KEY_HEADER] = PANEL_API_KEY;
-
-  const res = await axios.get(url, {
-    timeout: PANEL_TIMEOUT_MS,
-    maxRedirects: 5,
-    headers,
-    validateStatus: () => true,
-  });
-
-  if (res.status < 200 || res.status >= 300) {
-    const body =
-      typeof res.data === "string"
-        ? res.data.slice(0, 250)
-        : JSON.stringify(res.data).slice(0, 250);
-    return { ok: false, error: `Панель вернула HTTP ${res.status}: ${body}` };
+  try {
+    const res = await axios.get(url, {
+      timeout: PANEL_TIMEOUT_MS,
+      maxRedirects: 5,
+      headers,
+      validateStatus: () => true,
+    });
+    console.log(`Панель ответила: HTTP ${res.status}, data type: ${typeof res.data}, preview: ${String(res.data).slice(0, 200)}`);
+    if (res.status < 200 || res.status >= 300) {
+      const body =
+        typeof res.data === "string"
+          ? res.data.slice(0, 250)
+          : JSON.stringify(res.data).slice(0, 250);
+      return { ok: false, error: `Панель вернула HTTP ${res.status}: ${body}` };
+    }
+    if (typeof res.data === "object" && res.data) {
+      const key = findKeyInObject(res.data);
+      if (key) return { ok: true, key };
+      return { ok: false, error: "Панель вернула JSON, но ключ не найден." };
+    }
+    const text = String(res.data || "").trim();
+    if (looksLikeKey(text)) return { ok: true, key: text };
+    const match = text.match(/[A-Za-z0-9\-_:.=+/]{8,200}/);
+    if (match && looksLikeKey(match[0])) return { ok: true, key: match[0] };
+    return { ok: false, error: "Не распознал ключ в ответе панели." };
+  } catch (e) {
+    console.error("Ошибка в callPanelGenerateKey:", e.message, e.code, e.response?.status);
+    return { ok: false, error: `Ошибка запроса: ${e.message}` };
   }
-
-  if (typeof res.data === "object" && res.data) {
-    const key = findKeyInObject(res.data);
-    if (key) return { ok: true, key };
-    return { ok: false, error: "Панель вернула JSON, но ключ не найден." };
-  }
-
-  const text = String(res.data || "").trim();
-  if (looksLikeKey(text)) return { ok: true, key: text };
-
-  const match = text.match(/[A-Za-z0-9\-_:.=+/]{8,200}/);
-  if (match && looksLikeKey(match[0])) return { ok: true, key: match[0] };
-
-  return { ok: false, error: "Не распознал ключ в ответе панели." };
 }
 
 // Anti-duplication / state management
 const processed = new Map();
 const userCooldown = new Map();
 let genInProgress = false;
-const pendingUsername = new Map();
+const pendingState = new Map(); // Теперь храним состояние: { stage: 'username' | 'duration', username: string }
 
 function cleanup() {
   const t = now();
   const TTL = 10 * 60 * 1000;
-
   for (const [k, v] of processed) if (t - v > TTL) processed.delete(k);
-
   const CDTTL = 60 * 60 * 1000;
   for (const [k, v] of userCooldown) if (t - v > CDTTL) userCooldown.delete(k);
-
-  for (const [k, v] of pendingUsername) {
-    if (t - v.createdAt > 5 * 60 * 1000) pendingUsername.delete(k);
+  for (const [k, v] of pendingState) {
+    if (t - v.createdAt > 5 * 60 * 1000) pendingState.delete(k);
   }
 }
 
@@ -197,6 +193,17 @@ function menuKeyboard(admin) {
   return { reply_markup: { inline_keyboard: rows } };
 }
 
+function durationKeyboard() {
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "1 день", callback_data: "dur:1d" }, { text: "3 дня", callback_data: "dur:3d" }, { text: "7 дней", callback_data: "dur:7d" }],
+        [{ text: "Отмена", callback_data: "cancel" }],
+      ]
+    }
+  };
+}
+
 function mainText(admin, chatId) {
   return (
     `🕶 <b>${BOT_BRAND}</b>\n` +
@@ -220,32 +227,24 @@ bot.on("polling_error", (err) => {
 });
 
 // Actions
-async function generateForUsername(adminChatId, adminUserId, username, dedupeKey, duration) {
+async function generateForUsername(adminChatId, adminUserId, username, duration) {
+  const dedupeKey = `gen:${adminUserId}:${username}:${duration}:${now()}`;
   if (processed.has(dedupeKey)) {
     return bot.sendMessage(adminChatId, "🛡 Уже обработано (защита от дубля).");
   }
   processed.set(dedupeKey, now());
-
   const left = cooldownLeft(adminUserId);
   if (left > 0) return bot.sendMessage(adminChatId, `⏳ Подожди ${left} сек.`);
-
   if (genInProgress) return bot.sendMessage(adminChatId, "⏳ Генерация уже идёт. Подожди пару секунд.");
-
   genInProgress = true;
   setCooldown(adminUserId);
-
   try {
-    await bot.sendMessage(adminChatId, `⚡ Генерирую ключ для <b>${escapeHtml(username)}</b>...`, { parse_mode: "HTML" });
-
+    await bot.sendMessage(adminChatId, `⚡ Генерирую ключ для <b>${escapeHtml(username)}</b> на ${duration.replace('d', ' день(я)') }...`, { parse_mode: "HTML" });
     let generateUrl;
-    if (duration === "1d") {
-      generateUrl = PANEL_GENERATE_URL_1D;
-    } else if (duration === "3d") {
-      generateUrl = PANEL_GENERATE_URL_3D;
-    } else if (duration === "7d") {
-      generateUrl = PANEL_GENERATE_URL_7D;
-    }
-
+    if (duration === "1d") generateUrl = PANEL_GENERATE_URL_1D;
+    else if (duration === "3d") generateUrl = PANEL_GENERATE_URL_3D;
+    else if (duration === "7d") generateUrl = PANEL_GENERATE_URL_7D;
+    else throw new Error("Invalid duration");
     const r = await callPanelGenerateKey(generateUrl);
     if (!r.ok) {
       return bot.sendMessage(adminChatId, `❌ <b>Ошибка панели</b>\n${escapeHtml(r.error)}`, {
@@ -253,18 +252,14 @@ async function generateForUsername(adminChatId, adminUserId, username, dedupeKey
         ...menuKeyboard(true),
       });
     }
-
     const key = String(r.key || "").trim();
-
     // Send to the chat (money protection)
     const chatMsg =
       `🔑 <b>Ключ для ${escapeHtml(username)}</b>\n` +
       `<code>${escapeHtml(key)}</code>\n` +
       `━━━━━━━━━━━━━━\n` +
-      `Админ: <code>@${escapeHtml(adminUserId)}</code>`;
-
+      `Админ: <code>${adminUserId}</code>`;
     await bot.sendMessage(CHAT_ID, chatMsg, { parse_mode: "HTML" });
-
     // Confirm to admin
     return bot.sendMessage(adminChatId, "✅ Готово. Отправил ключ в чат.", { ...menuKeyboard(true) });
   } catch (e) {
@@ -292,14 +287,11 @@ bot.onText(/\/whoami/, async (msg) => {
   await bot.sendMessage(msg.chat.id, `chat_id: ${msg.chat.id}\nadmin: ${isAdmin(msg.from?.id)}`);
 });
 
-// /gen -> Asks username and duration
+// /gen -> Asks username
 bot.onText(/\/gen/, async (msg) => {
   cleanup();
   if (!isAdmin(msg.from?.id)) return bot.sendMessage(msg.chat.id, "⛔ Доступ ограничен. Напиши админу.");
-
-  const reqId = `req:${msg.chat.id}:${msg.message_id}:${now()}`;
-  pendingUsername.set(String(msg.chat.id), { reqId, createdAt: now() });
-
+  pendingState.set(String(msg.chat.id), { stage: 'username', createdAt: now() });
   await bot.sendMessage(
     msg.chat.id,
     "👤 Для кого ключ?\nНапиши юзернейм одним сообщением:\n<code>@durov</code>",
@@ -310,24 +302,19 @@ bot.onText(/\/gen/, async (msg) => {
 bot.on("callback_query", async (q) => {
   cleanup();
   try { await bot.answerCallbackQuery(q.id); } catch {}
-
   const chatId = q.message?.chat?.id;
   const userId = q.from?.id;
   if (!chatId) return;
-
   const admin = isAdmin(userId);
-
-  // dedupe callback itself
-  const cbKey = `cb:${q.id}`;
+  // dedupe callback by user + data + message_id to avoid strict q.id issues
+  const cbKey = `cb:${userId}:${q.data}:${q.message?.message_id || ''}`;
   if (processed.has(cbKey)) return;
   processed.set(cbKey, now());
 
   if (q.data === "menu") {
     return bot.sendMessage(chatId, mainText(admin, chatId), { parse_mode: "HTML", ...menuKeyboard(admin) });
   }
-
   if (!admin) return bot.sendMessage(chatId, "⛔ Доступ ограничен. Напиши админу.");
-
   if (q.data === "selftest") {
     return bot.sendMessage(
       chatId,
@@ -343,38 +330,48 @@ bot.on("callback_query", async (q) => {
       { parse_mode: "HTML", ...menuKeyboard(true) }
     );
   }
-
   if (q.data === "post") {
     // simple post flow: next message will be posted to CHAT_ID
-    pendingUsername.delete(String(chatId));
+    pendingState.delete(String(chatId));
     processed.set(`await_post:${chatId}`, now());
     processed.set(`await_post_ttl:${chatId}`, now() + 5 * 60 * 1000);
     return bot.sendMessage(chatId, "📣 Отправь следующее сообщение — я запощу его в чат (1 сообщение).", { ...menuKeyboard(true) });
   }
-
   if (q.data === "gen") {
-    const reqId = `req:${chatId}:${q.message?.message_id || "m"}:${q.id}:${now()}`;
-    pendingUsername.set(String(chatId), { reqId, createdAt: now() });
+    pendingState.set(String(chatId), { stage: 'username', createdAt: now() });
     return bot.sendMessage(
       chatId,
       "👤 Для кого ключ?\nНапиши юзернейм одним сообщением:\n<code>@durov</code>",
       { parse_mode: "HTML", ...menuKeyboard(true) }
     );
   }
+  if (q.data === "cancel") {
+    pendingState.delete(String(chatId));
+    return bot.sendMessage(chatId, "❌ Отменено.", { ...menuKeyboard(true) });
+  }
+  if (q.data.startsWith("dur:")) {
+    const duration = q.data.split(":")[1];
+    const state = pendingState.get(String(chatId));
+    if (state && state.stage === 'duration' && state.username) {
+      pendingState.delete(String(chatId));
+      return generateForUsername(chatId, userId, state.username, duration);
+    } else {
+      return bot.sendMessage(chatId, "❌ Сессия истекла. Нажми Генерировать заново.");
+    }
+  }
 });
 
 bot.on("message", async (msg) => {
   cleanup();
-
   const chatId = msg.chat?.id;
   const userId = msg.from?.id;
   const text = (msg.text || "").trim();
-  if (!chatId || !userId || !text) return;
-
+  if (!chatId || !userId || !text) return; // Ignore non-text messages
   // ignore commands
   if (text.startsWith("/")) return;
+  console.log(`→ incoming message: chat=${chatId}, user=${userId}, text='${text.slice(0,50)}'`);
 
-  // POST flow TTL
+  // POST flow
   const ttl = processed.get(`await_post_ttl:${chatId}`) || 0;
   if (processed.has(`await_post:${chatId}`)) {
     if (ttl && now() > ttl) {
@@ -382,11 +379,9 @@ bot.on("message", async (msg) => {
       processed.delete(`await_post_ttl:${chatId}`);
       return bot.sendMessage(chatId, "⏳ Режим постинга истёк. Нажми 📣 Постинг ещё раз.", { ...menuKeyboard(isAdmin(userId)) });
     }
-
     if (!isAdmin(userId)) return; // only admin can use it
     processed.delete(`await_post:${chatId}`);
     processed.delete(`await_post_ttl:${chatId}`);
-
     try {
       await bot.sendMessage(CHAT_ID, `📣 <b>${BOT_BRAND}</b>\n\n${escapeHtml(text)}`, { parse_mode: "HTML" });
       return bot.sendMessage(chatId, "✅ Запостил в чат.", { ...menuKeyboard(true) });
@@ -396,25 +391,17 @@ bot.on("message", async (msg) => {
     }
   }
 
-  // GENERATE username flow
-  if (isAdmin(userId) && pendingUsername.has(String(chatId))) {
-    const pending = pendingUsername.get(String(chatId));
+  // GENERATE flow (only for admin)
+  if (!isAdmin(userId)) return;
+  const state = pendingState.get(String(chatId));
+  if (!state) return; // No pending state, ignore
 
-    // clear pending BEFORE calling panel (so repeated telegram retries won't cause regen)
-    pendingUsername.delete(String(chatId));
-
+  if (state.stage === 'username') {
     if (!isValidUsernameInput(text)) {
-      const reqId = `req:${chatId}:${msg.message_id}:${now()}`;
-      pendingUsername.set(String(chatId), { reqId, createdAt: now() });
-      return bot.sendMessage(
-        chatId,
-        "⚠️ Юзернейм не похож на Telegram.\nНапиши так: <code>@durov</code>",
-        { parse_mode: "HTML", ...menuKeyboard(true) }
-      );
+      return bot.sendMessage(chatId, "❌ Некорректный юзернейм. Пример: @durov\nПопробуй ещё раз.", { parse_mode: "HTML" });
     }
-
     const username = normalizeUsername(text);
-    const dedupeKey = `${username}:${chatId}:${now()}`;
-    await generateForUsername(chatId, userId, username, dedupeKey, "1d");
+    pendingState.set(String(chatId), { stage: 'duration', username, createdAt: now() });
+    return bot.sendMessage(chatId, `📅 Выбери длительность для ${escapeHtml(username)}:`, { parse_mode: "HTML", ...durationKeyboard() });
   }
 });
