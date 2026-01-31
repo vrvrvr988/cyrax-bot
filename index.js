@@ -277,7 +277,6 @@ bot.onText(/\/whoami/, async (msg) => {
   await bot.sendMessage(msg.chat.id, `chat_id: ${msg.chat.id}\nadmin: ${isAdmin(msg.from?.id)}`);
 });
 
-// /gen -> Asks username
 bot.onText(/\/gen/, async (msg) => {
   cleanup();
   if (!isAdmin(msg.from?.id)) return bot.sendMessage(msg.chat.id, "⛔ Доступ ограничен. Напиши админу.");
@@ -292,7 +291,6 @@ bot.onText(/\/gen/, async (msg) => {
   );
 });
 
-// Buttons Handling
 bot.on("callback_query", async (q) => {
   cleanup();
   try { await bot.answerCallbackQuery(q.id); } catch {}
@@ -329,7 +327,6 @@ bot.on("callback_query", async (q) => {
   }
 
   if (q.data === "post") {
-    // simple post flow: next message will be posted to CHAT_ID
     pendingUsername.delete(String(chatId));
     processed.set(`await_post:${chatId}`, now());
     processed.set(`await_post_ttl:${chatId}`, now() + 5 * 60 * 1000);
@@ -370,7 +367,7 @@ bot.on("message", async (msg) => {
 
     if (!isAdmin(userId)) return; // only admin can use it
     processed.delete(`await_post:${chatId}`);
-    processed.delete(`await_post_ttl:${chatId}`);
+    processed.delete(`await_post_ttl:${chatId}`); 
 
     try {
       await bot.sendMessage(CHAT_ID, `📣 <b>${BOT_BRAND}</b>\n\n${escapeHtml(text)}`, { parse_mode: "HTML" });
@@ -385,7 +382,6 @@ bot.on("message", async (msg) => {
   if (isAdmin(userId) && pendingUsername.has(String(chatId))) {
     const pending = pendingUsername.get(String(chatId));
 
-    // clear pending BEFORE calling panel (so repeated telegram retries won't cause regen)
     pendingUsername.delete(String(chatId));
 
     if (!isValidUsernameInput(text)) {
