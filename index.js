@@ -382,6 +382,7 @@ bot.on("message", async (msg) => {
   if (isAdmin(userId) && pendingUsername.has(String(chatId))) {
     const pending = pendingUsername.get(String(chatId));
 
+    // clear pending BEFORE calling panel (so repeated telegram retries won't cause regen)
     pendingUsername.delete(String(chatId));
 
     if (!isValidUsernameInput(text)) {
